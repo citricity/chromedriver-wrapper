@@ -23,6 +23,7 @@ import sys
 import tempfile
 import urllib.request
 import zipfile
+from pathlib import Path
 
 class ChromeDriverFetcher:
     downloadsFile = "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
@@ -61,15 +62,88 @@ class ChromeDriverFetcher:
         if (not os.path.isdir(self.cacheDir)):
             os.mkdir(self.cacheDir)
 
+    def getAppDir(self):
+        if os.name == 'posix':  # Linux/macOS
+            dir = Path.home()
+        elif os.name == 'nt':  # Windows
+            dir = Path(os.getenv('LOCALAPPDATA'))
+        else:
+            raise OSError("Unsupported operating system")
+        return dir
+
+    def getPuppeteerCacheDir(self):
+        # Check if the PUPPETEER_CACHE_DIR environment variable is set
+        env_cache_dir = os.getenv('PUPPETEER_CACHE_DIR')
+
+        if env_cache_dir:
+            # If the environment variable is set, use it
+            cache_dir = Path(env_cache_dir)
+        else:
+            # Otherwise, build the default cache directory path based on the OS
+            if os.name == 'posix':  # Linux/macOS
+                cache_dir = Path.home() / '.cache' / 'puppeteer'
+            elif os.name == 'nt':  # Windows
+                cache_dir = Path(os.getenv('LOCALAPPDATA')) / 'puppeteer' / 'Cache'
+            else:
+                raise OSError("Unsupported operating system")
+
+        return cache_dir
+
+    def getPuppeteerChromePath(self):
+        # Support puppeteer installation (which is google's recommended way of installing)
+        # First, determine the Puppeteer app / cache directory
+        app_dir = self.getAppDir()
+        cache_dir = self.getPuppeteerCacheDir()
+
+        # Define the partial paths based on the operating system
+        if os.name == 'posix':  # Linux/macOS
+            if Path("/Applications").exists():  # macOS
+                partial_path = "chrome/mac-*/chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+            else:  # Linux
+                partial_path = "chrome/linux-*/chrome-linux-x64/google-chrome"
+        elif os.name == 'nt':  # Windows
+            partial_path = "chrome/win-*/chrome-win/chrome.exe"
+        else:
+            raise OSError("Unsupported operating system")
+
+        # Use glob to search for all possible Google Chrome for Testing apps
+        google_for_testing_paths = list(app_dir.glob(partial_path))
+        if not google_for_testing_paths:
+            google_for_testing_paths = list(cache_dir.glob(partial_path))
+
+        if not google_for_testing_paths:
+            raise Exception("Could not find puppeteer path for Google Chrome for Testing")
+
+        # Extract version numbers from the directory names
+        versioned_paths = []
+        for path in google_for_testing_paths:
+            # Use regex to find version number in the path
+            version_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', str(path))
+            if version_match:
+                version = tuple(map(int, version_match.group(0).split('.')))
+                versioned_paths.append((version, path))
+
+        # Sort the paths by version number in descending order
+        versioned_paths.sort(reverse=True, key=lambda x: x[0])
+
+        # Return the path with the latest version
+        return versioned_paths[0][1] if versioned_paths else None
+
     def getChromePath(self):
         if (self.pathToChrome is not None):
             return self.pathToChrome
         if (sys.platform == 'darwin'):
-            return "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+            darwinPath = "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+            if (os.path.exists(darwinPath)):
+                return darwinPath
         elif (sys.platform == 'linux'):
             return distutils.spawn.find_executable("google-chrome-stable")
-
-        raise ValueError("Unable to find Chrome on %s" % ( sys.platform ))
+        # We didn't find "Google Chrome for Testing", so lets see if it was installed via
+        # puppeteer
+        puppeteerPath = self.getPuppeteerChromePath()
+        if (puppeteerPath):
+            return puppeteerPath
+        raise Exception("Failed to find a valid Google Chrome for Testing app - if you have node installed, you can install it via npx @puppeteer/browsers install chrome@stable")
 
     def getChromeVersion(self):
         versionOutput = subprocess.check_output([self.getChromePath(), '--version'])
@@ -142,7 +216,7 @@ class ChromeDriverFetcher:
 
     def getPlatform(self):
         if (sys.platform == 'darwin'):
-            return "mac-%s" % platform.machine()
+            return "mac-%s" % platform.machine().replace("x86_", "x")
         if (sys.platform.startswith('linux')):
             if (platform.machine() == 'x86_64'):
                 return "linux64"
@@ -159,6 +233,7 @@ class ChromeDriverFetcher:
     def downloadChromeDriver(self):
         print("Downloading chromedriver for Chrome %s on %s" % ( self.chromeVersion, self.platform ))
         url = self.getChromedriverUrl()
+        print("Using url %s" % (url))
 
         targetDirectory = tempfile.TemporaryDirectory()
         targetFile = self.getZipPath(targetDirectory)
@@ -212,14 +287,31 @@ class ChromeDriverFetcher:
         if (config.get('PATH_TO_CHROME') is not None):
             self.pathToChrome = config.get('PATH_TO_CHROME')
 
-
         return config
 
     def executeDriver(self):
         driverPath = self.getTargetPath()
-        if (not os.path.isfile(driverPath) or not os.access(driverPath, os.X_OK)):
+
+        # Ensure we have ChromeDriver downloaded and extracted
+        if not os.path.isfile(driverPath) or not os.access(driverPath, os.X_OK):
             self.downloadAndUnzipChromeDriver()
 
+        # Get the path to Google Chrome for Testing
+        chromeBinaryPath = self.getChromePath()
+
+        # Put the path into a config so that moodle can reference it.
+        print(f"CDW_CHROME_BINARY_PATH={str(self.getChromePath())}")
+        config_dir = self.getAppDir() / ".chromedriver_wrapper"
+        config_file = config_dir / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        with open(config_file, 'w') as f:
+            f.write(f"CDW_CHROME_BINARY_PATH={str(chromeBinaryPath)}\n")
+
+        print(f"Chrome binary path written to: {config_file}")
+
+        print(f"Executing ChromeDriver with args: {self.chromedriverArgs}")
+
+        # Run ChromeDriver with the args
         subprocess.run(
             self.chromedriverArgs,
             executable=driverPath,
